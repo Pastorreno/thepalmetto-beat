@@ -1,0 +1,432 @@
+{
+  "name": "Palmetto Beat — Newsroom",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 5,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "5:00 AM Daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Palmetto Beat — RSS sources, each verified live on 2026-08-03.\n//\n// tier 1   = highest priority\n// official = an authoritative city feed; bypasses the local-place-name test\n//            (everything on it is Palmetto by definition)\n//\n// NOTE: palmettofl.org ModID=76 was tested and REMOVED — its channel is\n// \"Palmetto - Pages\", a site directory listing (\"Agendas\", \"Minutes\",\n// \"Human Resources\"), not News Flash. No News Flash RSS module exists on\n// this site. Check palmettofl.org/m/NewsFlash manually — see docs/03-SOURCES.md.\n\nreturn [\n  { url: 'https://www.palmettofl.org/RSSFeed.aspx?ModID=58&CID=All-calendar.xml', source: 'City of Palmetto — Calendar', tier: 1, official: true },\n  { url: 'https://www.palmettofl.org/RSSFeed.aspx?ModID=65&CID=All-0',      source: 'City of Palmetto — Agendas', tier: 1, official: true },\n  { url: 'https://news.google.com/rss/search?q=%22City+of+Palmetto%22+OR+%22Palmetto+commission%22+when:14d&hl=en-US&gl=US&ceid=US:en', source: 'Google News — Palmetto government', tier: 1 },\n  { url: 'https://news.google.com/rss/search?q=%22Palmetto%22+Florida+-%22Palmetto+Bay%22+when:7d&hl=en-US&gl=US&ceid=US:en', source: 'Google News — Palmetto FL', tier: 2 },\n  { url: 'https://www.suncoastpost.com/feed/',                              source: 'The Suncoast Post', tier: 2 },\n  { url: 'https://news.google.com/rss/search?q=%22Manatee+County%22+Florida+when:7d&hl=en-US&gl=US&ceid=US:en', source: 'Google News — Manatee County', tier: 3 },\n  { url: 'https://www.mysuncoast.com/arc/outboundfeeds/rss/',               source: 'ABC7 WWSB / MySuncoast', tier: 3 },\n  { url: 'https://thebradentonjournal.substack.com/feed',                   source: 'The Bradenton Journal', tier: 3 }\n].map(json => ({ json }));"
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Feed List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Fetch Feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -680,
+        300
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse every feed and normalise to a flat item shape.\n// NOTE: relies on 1:1 order alignment with 'Feed List'. 'Fetch Feed' is set to\n// alwaysOutputData + continueRegularOutput so a dead feed still emits a slot and\n// alignment is preserved.\nconst feeds = $('Feed List').all().map(i => i.json);\n\nconst strip = (s) => String(s ?? '')\n  .replace(/<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>/g, '$1')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&amp;/g, '&').replace(/&#39;/g, \"'\").replace(/&quot;/g, '\"')\n  .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')\n  .replace(/\\s+/g, ' ')\n  .trim();\n\nconst tag = (block, name) => {\n  const m = block.match(new RegExp('<' + name + '[^>]*>([\\\\s\\\\S]*?)<\\\\/' + name + '>', 'i'));\n  return m ? strip(m[1]) : '';\n};\n\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const feed = feeds[i] || { source: 'unknown', tier: 3, official: false, url: '' };\n  const xml = String(items[i].json?.data ?? items[i].json?.body ?? '');\n  if (!xml || xml.indexOf('<') === -1) continue;\n\n  // Handle both RSS <item> and Atom <entry>\n  const blocks = xml.match(/<item[\\s>][\\s\\S]*?<\\/item>/gi) || xml.match(/<entry[\\s>][\\s\\S]*?<\\/entry>/gi) || [];\n\n  for (const b of blocks) {\n    const title = tag(b, 'title');\n    if (!title) continue;\n\n    let link = tag(b, 'link');\n    if (!link) {\n      const m = b.match(/<link[^>]*href=\"([^\"]+)\"/i);\n      link = m ? m[1] : '';\n    }\n\n    const dateRaw = tag(b, 'pubDate') || tag(b, 'published') || tag(b, 'updated') || tag(b, 'dc:date');\n    const parsed = dateRaw ? new Date(dateRaw) : null;\n    const iso = parsed && !isNaN(parsed) ? parsed.toISOString() : null;\n\n    const summary = (tag(b, 'description') || tag(b, 'summary') || tag(b, 'content')).slice(0, 600);\n\n    out.push({\n      json: {\n        title,\n        link,\n        summary,\n        publishedAt: iso,\n        source: feed.source,\n        tier: feed.tier,\n        official: !!feed.official,\n        dedupeKey: (tag(b, 'guid') || link || title).slice(0, 300)\n      }\n    });\n  }\n}\n\nreturn out;"
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Parse & Normalise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Relevance filter, tuned against live feed output (2026-08-03).\n// Kills the dominant noise classes: obituaries, real-estate listings,\n// and the several other US towns also called Palmetto.\n//\n// TUNE THESE. If the draft feels thin, raise MAX_AGE_DAYS. If it feels\n// noisy, raise MIN_SCORE.\nconst MAX_AGE_DAYS = 7;    // tier 2 / 3 — matches a twice-weekly issue\nconst TIER1_AGE_DAYS = 30; // civic notices stay relevant longer\nconst MIN_SCORE = 0;\nconst MAX_ITEMS = 60;\n\n// Domains that are pure noise in these feeds\nconst BLOCK_DOMAINS = [\n  'tributearchive.com', 'legacy.com', 'echovita.com', 'dignitymemorial.com',\n  'findagrave.com', 'realtor.com', 'zillow.com', 'redfin.com', 'homes.com',\n  'trulia.com', 'apartments.com', 'youtube.com', 'iqair.com', 'maxpreps.com'\n];\n\n// Title patterns that are noise regardless of source\nconst BLOCK_TITLE = [\n  /\\bobituar/i, /\\bfuneral home\\b/i, /\\bin loving memory\\b/i, /\\bdeath notice\\b/i,\n  /\\bfor sale\\b/i, /\\bopen house\\b/i, /\\bMLS\\b/, /\\bsq\\.? ?ft\\b/i,\n  /^\\d+\\s+\\w+.*,\\s*(FL|Florida)\\s*\\d{5}/i,   // bare street-address listings\n  /\\bair quality index\\b/i, /\\bhoroscope\\b/i\n];\n\n// Other \"Palmetto\"s that are NOT our Palmetto.\n// Palmetto GA (Fulton County), Palmetto Bay FL, Palmetto Bluff SC,\n// the Palmetto State (SC), and the insect.\nconst WRONG_PALMETTO = [\n  /palmetto bay/i, /palmetto bluff/i, /palmetto state/i, /palmetto bug/i,\n  /palmetto general/i, /palmetto, ?(ga|sc|georgia|south carolina)/i,\n  /\\bfulton county\\b/i, /\\bunion city\\b/i, /\\bpalmetto, ?tn\\b/i,\n  /palmetto moon/i, /palmetto health/i,\n  // Miami-Dade: the Palmetto Expressway (SR 826), Palmetto Senior High,\n  // and the Palmetto Panthers are all ~200 miles from us.\n  /palmetto expressway/i, /palmetto panthers/i, /palmetto senior high/i,\n  /\\bmiami\\b/i, /\\bhialeah\\b/i, /miami-dade/i\n];\n\n// Local place names that make a regional story ours\nconst LOCAL = /\\b(palmetto|ellenton|manatee county|terra ceia|rubonia|memphis road|old memphis|10th street|8th avenue|riverside drive|green bridge|manatee river|palmetto high|lincoln middle|blackburn|snead island|sunshine skyway)\\b/i;\n\nconst now = Date.now();\nconst out = [];\nconst dropped = { domain: 0, title: 0, wrongPalmetto: 0, stale: 0, notLocal: 0, lowScore: 0 };\n\nfor (const item of items) {\n  const j = item.json;\n  const hay = `${j.title} ${j.summary}`;\n  const link = String(j.link || '').toLowerCase();\n\n  // 1. cheap noise rejects first\n  if (BLOCK_DOMAINS.some(d => link.includes(d))) { dropped.domain++; continue; }\n  if (BLOCK_TITLE.some(re => re.test(j.title))) { dropped.title++; continue; }\n  if (WRONG_PALMETTO.some(re => re.test(hay))) { dropped.wrongPalmetto++; continue; }\n\n  // 2. recency — undated items are kept (city notices often have no date)\n  const maxAge = (j.tier === 1 ? TIER1_AGE_DAYS : MAX_AGE_DAYS) * 86400000;\n  if (j.publishedAt) {\n    const age = now - new Date(j.publishedAt).getTime();\n    if (age > maxAge || age < -86400000) { dropped.stale++; continue; }\n  }\n\n  // 3. relevance — only OFFICIAL city feeds bypass the local test.\n  //    Google News tier-1 queries are searches, not authoritative sources,\n  //    so they still have to name a local place.\n  const isLocal = LOCAL.test(hay);\n  if (!j.official && !isLocal) { dropped.notLocal++; continue; }\n\n  // 4. score for ordering\n  let score = 0;\n  if (j.official) score += 60;\n  else if (j.tier === 1) score += 40;\n  if (/\\bpalmetto\\b/i.test(j.title)) score += 30;\n  if (/\\bellenton\\b/i.test(hay)) score += 15;\n  if (/\\b(commission|CRA|council|ordinance|rezon|budget|permit|development|redevelop|annex)\\b/i.test(hay)) score += 25;\n  if (/\\b(school|police|sheriff|fire|road|closure|water|utility|storm|hurricane|evacuat)\\b/i.test(hay)) score += 15;\n  if (/\\b(opening|opens|new business|ribbon cutting|grand opening|restaurant|shop|store)\\b/i.test(hay)) score += 12;\n  if (/\\b(festival|market|event|concert|parade|fair|cleanup)\\b/i.test(hay)) score += 10;\n  if (j.tier === 3) score -= 10;\n\n  if (score < MIN_SCORE) { dropped.lowScore++; continue; }\n\n  out.push({ json: { ...j, score, isLocal } });\n}\n\nconsole.log('Filter:', items.length, 'in ->', out.length, 'kept. Dropped:', JSON.stringify(dropped));\n\nout.sort((a, b) => b.json.score - a.json.score);\nreturn out.slice(0, MAX_ITEMS);"
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "Filter & Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "removeItemsSeenInPreviousExecutions",
+        "logic": "removeItemsWithAlreadySeenKeyValues",
+        "dedupeValue": "={{ $json.dedupeKey }}",
+        "options": {
+          "historySize": 3000
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Drop Already Seen",
+      "type": "n8n-nodes-base.removeDuplicates",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        300
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "Collect",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the drafting prompt from everything collected.\nconst rows = ($input.first().json.data) || [];\n\nif (!rows.length) {\n  return [{ json: { empty: true, count: 0, digest: '', prompt: '' } }];\n}\n\nconst byTier = { 1: [], 2: [], 3: [] };\nfor (const r of rows) (byTier[r.tier] || byTier[3]).push(r);\n\nconst fmt = (r) => `- [${r.source}] ${r.title}\\n  ${r.link}\\n  ${r.summary ? r.summary.slice(0, 300) : ''}`;\n\nconst digest = [\n  '## TIER 1 — Official city / civic sources',\n  (byTier[1].map(fmt).join('\\n') || '(nothing new)'),\n  '',\n  '## TIER 2 — Local news and events',\n  (byTier[2].map(fmt).join('\\n') || '(nothing new)'),\n  '',\n  '## TIER 3 — Regional coverage mentioning Palmetto/Manatee',\n  (byTier[3].map(fmt).join('\\n') || '(nothing new)')\n].join('\\n');\n\nconst today = new Date().toLocaleDateString('en-US', {\n  weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',\n  timeZone: 'America/New_York'\n});\n\nconst prompt = `You are the assistant editor for The Palmetto Beat, a local community newsletter for Palmetto, Florida.\n\nToday is ${today}.\n\nBelow are ${rows.length} items collected from RSS feeds in the last 48 hours. Draft the next issue from them.\n\nHOUSE STYLE\n- Voice: a well-informed neighbour who went to the commission meeting so the reader did not have to.\n- Short sentences. Plain words. No jargon, no hype, no filler.\n- Every item answers \"what does this mean for me?\"\n- Neutral on politics, warm on community.\n- Name real people, businesses and streets wherever the sources support it.\n- Never bury the lede.\n\nHARD RULES\n- Use ONLY facts present in the source items below. Invent nothing.\n- Every claim must be traceable to a source link. Include the link for each item.\n- Where a fact needs confirming with a primary source before publication, append: [VERIFY: what to check, and with whom]\n- If a story is sensitive (death, crime, hate crime, litigation), write it plainly and factually, attribute to the reporting outlet, do NOT speculate about motive or blame, and mark it [SENSITIVE — editor review required].\n- If a section has nothing worth reading today, write \"(nothing this issue)\" rather than padding it.\n\nOUTPUT\nReturn clean HTML only — no markdown, no code fences, no preamble. Use h2 for section headings, p for body, ul/li for lists, a href for links.\n\nSTRUCTURE\n<h2>The Lead</h2> — the single most important story, 150-250 words: what happened, what it means for residents, what happens next and when.\n<h2>Quick Hits</h2> — 4-6 bullets, one or two sentences each.\n<h2>Around Town</h2> — the human section: a business opening, a local person, a community moment.\n<h2>On the Calendar</h2> — upcoming events as: <strong>Name</strong> — day, time · location · cost.\n<h2>Business Spotlight</h2> — leave as a placeholder note for the editor to fill.\n<h2>One Last Thing</h2> — a short, warm closing note.\n\nAfter the HTML, add:\n<hr>\n<h2>EDITOR NOTES</h2>\n- 3 suggested subject lines, each under 45 characters\n- every [VERIFY] item gathered into one checklist\n- any story you judged too thin or too unverified to run, and why\n\nSOURCE ITEMS\n${digest}`;\n\nreturn [{ json: { empty: false, count: rows.length, digest, prompt } }];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-items",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000009",
+      "name": "Anything New?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-00000000000a",
+      "name": "Draft the Issue",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-opus-5",
+          "mode": "list",
+          "cachedResultName": "Claude Opus 5"
+        },
+        "options": {
+          "maxTokensToSample": 8000,
+          "temperature": 0.4
+        }
+      },
+      "id": "a1000000-0000-4000-8000-00000000000b",
+      "name": "Claude",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        900,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Wrap the model output in a minimal HTML shell for readable review.\nconst raw = String($json.text ?? $json.response ?? $json.output ?? '')\n  .replace(/^```html\\s*/i, '')\n  .replace(/```\\s*$/,'')\n  .trim();\n\nconst count = $('Build Prompt').first().json.count;\nconst stamp = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });\n\nconst html = `<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>The Palmetto Beat — draft ${stamp}</title>\n<style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#1a1a1a}h1{font-size:24px;border-bottom:3px solid #1a1a1a;padding-bottom:8px}h2{font-size:18px;margin-top:32px;text-transform:uppercase;letter-spacing:.05em;color:#444}a{color:#0b6}.meta{color:#777;font-size:13px}</style>\n</head><body>\n<h1>The Palmetto Beat — DRAFT</h1>\n<p class=\"meta\">Generated ${stamp} · ${count} source items · NOT FOR PUBLICATION UNTIL VERIFIED</p>\n${raw}\n</body></html>`;\n\nreturn [{ json: { html, count, stamp } }];"
+      },
+      "id": "a1000000-0000-4000-8000-00000000000c",
+      "name": "Wrap HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "html",
+        "options": {
+          "fileName": "palmetto-beat-draft.html",
+          "mimeType": "text/html"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-00000000000d",
+      "name": "To File",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "={{ $env.PALMETTO_TELEGRAM_CHAT_ID }}",
+        "binaryData": true,
+        "additionalFields": {
+          "caption": "=📰 The Palmetto Beat — draft ready\n{{ $('Wrap HTML').first().json.count }} source items · {{ $('Wrap HTML').first().json.stamp }}\n\nOpen, verify every [VERIFY] tag, then paste into beehiiv."
+        }
+      },
+      "id": "a1000000-0000-4000-8000-00000000000e",
+      "name": "Telegram — Send Draft",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $env.PALMETTO_TELEGRAM_CHAT_ID }}",
+        "text": "=🌴 Palmetto Beat newsroom ran, but nothing new cleared the filter today. No draft generated.",
+        "additionalFields": {}
+      },
+      "id": "a1000000-0000-4000-8000-00000000000f",
+      "name": "Telegram — Nothing New",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        440
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "5:00 AM Daily": {
+      "main": [
+        [
+          {
+            "node": "Feed List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feed List": {
+      "main": [
+        [
+          {
+            "node": "Fetch Feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Feed": {
+      "main": [
+        [
+          {
+            "node": "Parse & Normalise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Normalise": {
+      "main": [
+        [
+          {
+            "node": "Filter & Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter & Score": {
+      "main": [
+        [
+          {
+            "node": "Drop Already Seen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Already Seen": {
+      "main": [
+        [
+          {
+            "node": "Collect",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect": {
+      "main": [
+        [
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Anything New?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything New?": {
+      "main": [
+        [
+          {
+            "node": "Draft the Issue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram — Nothing New",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Draft the Issue",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft the Issue": {
+      "main": [
+        [
+          {
+            "node": "Wrap HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wrap HTML": {
+      "main": [
+        [
+          {
+            "node": "To File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "To File": {
+      "main": [
+        [
+          {
+            "node": "Telegram — Send Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {}
+}
